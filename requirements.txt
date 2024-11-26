@@ -1,3 +1,4 @@
 jamf-pro-sdk
+packaging
 pathlib
 requests
