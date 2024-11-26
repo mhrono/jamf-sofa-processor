@@ -1,4 +1,12 @@
-Howdy! This repo is _very_ much in MVP state right now. Development is ongoing and breaking changes will be made. Wiki and other docs forthcoming.
+# macOS Update Processor
+__Keep your macOS devices up to date using Declarative Device Management, Jamf Pro, and a SOFA feed.__
 
-To do (among many other things):
-- Add a check/retry loop for declarations erroneously failed with `INVALID_CONFIGURATION_DECLARATION` due to jamf PI120238
+## Overview
+
+Let's be real. Keeping macOS devices up to date at scale isn't fun. I know I'm not the only one still occasionally pining for the days of sending `softwareupdate -aiR` over ARD and calling it a day. Unfortunately, those days are gone. Fortunately, this can get close!
+
+Given appropriate API credentials to your jamf tenant, this script will find outdated devices, ensure they're eligible for DDM-based update enforcement, and handle all the dirty work for you.
+
+## Usage
+
+This section coming very soon! (read: after US Thanksgiving)
