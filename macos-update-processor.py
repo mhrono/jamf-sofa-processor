@@ -289,21 +289,21 @@ parser.add_argument(
     "--excludegroup",
     nargs="+",
     metavar="Excluded Group Name",
-    help="Name of a Smart Computer Group containing devices to EXCLUDE from automated updates (such as conference room devices)",
+    help="Name of a Smart/Static Computer Group containing devices to EXCLUDE from automated updates (such as conference room devices)",
 )
 
 parser.add_argument(
     "--overridegroup",
     nargs="+",
     metavar="Override Group Name",
-    help="Name of a Smart Computer Group to target for updates (overrides default outdated group)",
+    help="Name of a Smart/Static Computer Group to target for updates (overrides default outdated group)",
 )
 
 parser.add_argument(
     "--canarygroup",
     nargs="+",
     metavar="Canary Group Name",
-    help='Name of a Smart Computer Group containing devices to always receive a 2-day installation deadline.\n\nNOTE: Canary deployments are NOT currently compatible with --targetversion "MINOR".',
+    help='Name of a Smart/Static Computer Group containing devices to always receive a 2-day installation deadline.\n\nNOTE: Canary deployments are NOT currently compatible with --targetversion "MINOR".',
 )
 
 parser.add_argument(
@@ -373,7 +373,7 @@ parser.add_argument(
     nargs="?",
     type=check_path,
     metavar="Path or filename",
-    help="Full path or filename for storing plan data.",
+    help="Full path or filename for storing plan data",
 )
 
 parser.add_argument(
