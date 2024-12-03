@@ -106,11 +106,11 @@ from tempfile import NamedTemporaryFile
 from jamf_pro_sdk import JamfProClient, SessionConfig
 from jamf_pro_sdk.models.classic import computer_groups
 from jamf_pro_sdk.models.pro import computers
-from jamf_pro_sdk.clients.pro_api.pagination import FilterField
+from jamf_pro_sdk.clients.pro_api.pagination import FilterField, filter_group
 from jamf_pro_sdk.clients.auth import ApiClientCredentialsProvider
 
 ## Version
-scriptVersion = "0.2"
+scriptVersion = "0.4"
 
 ## Arguments
 
@@ -212,7 +212,7 @@ def check_path(datafile):
 
 
 parser = argparse.ArgumentParser(
-    formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    formatter_class=argparse.RawTextHelpFormatter,
     argument_default=argparse.SUPPRESS,
 )
 
@@ -277,7 +277,12 @@ parser.add_argument(
     nargs="?",
     type=check_version_arg,
     metavar="Version (string or type)",
-    help="Target macOS version for deployment. Can be a specific version (e.g. 14.6.1) or a latest version type (ANY/MAJOR/MINOR). Defaults to ANY (will target the latest and greatest Cupertino has to offer)",
+    help="""Target macOS version for deployment. Can be any of the following:
+
+- Specific Version -- A specific macOS version to target for ALL eligible devices (e.g. 14.7.1) | Use --overridegroup and/or --excludegroup to target subsets of devices
+- "ANY" (default)  -- The latest and greatest Cupertino has to offer for ALL eligible devices
+- "MAJOR"          -- Target ONLY devices running the latest major version of macOS (e.g. updates devices on macOS 15 to the latest release of macOS 15)
+- "MINOR"          -- Target devices running the 2 latest major versions of macOS for their respective latest releases (e.g. 14.x to latest 14 and 15.x to latest 15)""",
 )
 
 parser.add_argument(
@@ -371,7 +376,12 @@ parser.add_argument(
     help="Full path or filename for storing plan data.",
 )
 
-parser.add_argument("--version", action="version", version=f"{scriptVersion}")
+parser.add_argument(
+    "--version",
+    action="version",
+    version=f"{scriptVersion}",
+    help="Show script version and exit",
+)
 
 args = parser.parse_args()
 
@@ -439,7 +449,9 @@ logger.handlers = []
 
 ## Create handlers
 logToFile = logging.FileHandler(str(logFile))
+jamfLogToFile = logging.FileHandler(str(logFile))
 logToConsole = logging.StreamHandler(sys.stdout)
+jamfLogToConsole = logging.StreamHandler(sys.stdout)
 
 ## Configure logging level and format
 logLevel = logging.DEBUG if debug else logging.INFO
@@ -456,14 +468,24 @@ logToConsole.setLevel(logLevel)
 
 ## Set log format
 logToFile.setFormatter(logFormat)
+jamfLogToFile.setFormatter(logFormat)
 logToConsole.setFormatter(logFormat)
+jamfLogToConsole.setFormatter(logFormat)
+
+## Configure jamf SDK logging
+jamfLogger = logging.getLogger("jamf_pro_sdk")
+jamfLogLevel = logging.DEBUG if debug else logging.WARNING
+jamfLogger.setLevel(jamfLogLevel)
+
+## Add handlers to jamf logger
+jamfLogger.addHandler(jamfLogToFile)
+jamfLogger.addHandler(jamfLogToConsole)
 
 ## Add handlers to root logger
 logger.addHandler(logToFile)
 logger.addHandler(logToConsole)
 
 ###############################
-logging.info(f"Logging to file at {logFile}")
 
 
 ## Exit with a specified exit code, logging level, and final message
@@ -825,12 +847,16 @@ def convertJamfTimestamp(timestamp):
 
     if not timestamp or not check_positive(str(timestamp)):
         logging.error("Timestamp missing or malformed--cannot convert!")
-        return 0
+        return None
 
     timestampSeconds = round(timestamp / 1000)
     timeObject = datetime.fromtimestamp(timestampSeconds)
 
-    timeData = {"epochTime": timestampSeconds, "datetime": timeObject}
+    timeData = (
+        {"epochTime": timestampSeconds, "datetime": timeObject}
+        if isinstance(timestampSeconds, int)
+        else None
+    )
 
     logging.debug(
         f"Converted timestamp {timestamp} to {timeObject.strftime("%Y-%m-%dT%H:%M:%S")} (epoch: {timestampSeconds})"
@@ -893,7 +919,6 @@ def checkExistingDevicePlans(deviceId, objectType="COMPUTER"):
         Logs debug information about the attempts to check for existing plans and the results.
     """
 
-
     global existingPlanCount
     global existingPlans
 
@@ -934,10 +959,7 @@ def checkExistingDevicePlans(deviceId, objectType="COMPUTER"):
             continue
 
     if not existingActivePlan:
-        declarationItem = {
-            "deviceId": deviceId,
-            "objectType": objectType
-        }
+        declarationItem = {"deviceId": deviceId, "objectType": objectType}
         return declarationItem
     else:
         existingPlanCount += 1
@@ -1337,7 +1359,10 @@ def checkDeviceDDMEligible(deviceRecord):
     else:
         device = deviceRecord
 
-    if isinstance(device, computers.Computer):
+    if (
+        isinstance(device, computers.Computer)
+        and device.operatingSystem.version is not None
+    ):
         logging.debug(f"Checking DDM update eligibility for device {device.id}...")
     else:
         logging.error(
@@ -1362,7 +1387,7 @@ def checkDeviceDDMEligible(deviceRecord):
         logging.warning(
             f"Some criteria were not met when checking DDM update eligibility for device ID {device.id}. "
             f"Update plans will not be sent to this device.\n\nEligibility failed the following check(s):\n"
-            f"{', '.join([k for k in deviceEligibilityData if not deviceEligibilityData.get(k)])}"
+            f"{', '.join([k for k in deviceEligibilityData if not deviceEligibilityData.get(k)])}\n"
         )
         return None
 
@@ -1491,14 +1516,38 @@ def getPlanData(planUUID):
         else:
             deadlineExceeded = None
         deviceData = planInfo.get("device")
-        deviceCurrentOSData = jamfClient.pro_api_request(
-            method="GET",
-            resource_path=deviceData.get("href").lstrip("/"),
-            query_params={"section": "OPERATING_SYSTEM"},
-        ).json()
-        deviceCurrentOSVersion = deviceCurrentOSData.get("operatingSystem").get(
-            "version"
-        )
+        if deviceCurrentOSVersion := next(
+            (
+                device.operatingSystem.version
+                for device in outdatedDevices
+                if device.id == deviceData.get("deviceId")
+            ),
+            None,
+        ):
+            logging.debug(
+                f"Retrieved device current OS version: {deviceCurrentOSVersion}"
+            )
+        else:
+            deviceCurrentOSData = jamfClient.pro_api_request(
+                method="GET",
+                resource_path=deviceData.get("href").lstrip("/"),
+                query_params={"section": "OPERATING_SYSTEM"},
+            )
+            if deviceCurrentOSData.ok:
+                deviceCurrentOSVersion = computers.Computer(
+                    **deviceCurrentOSData.json()
+                ).operatingSystem.version
+                logging.debug(
+                    f"Retrieved device current OS version: {deviceCurrentOSVersion}"
+                )
+            else:
+                logging.error(
+                    f"Failed to retrieve device current OS version for device {deviceData.get("deviceId")}"
+                )
+                deviceCurrentOSVersion = "0"
+            logging.debug(
+                f"Retrieved device current OS version: {deviceCurrentOSVersion}"
+            )
         if declarationConfiguration:
             configurationJson = json.loads(declarationConfiguration)
             targetVersionString = configurationJson.get("TargetOSVersion")
@@ -1690,7 +1739,9 @@ def run():
         jamfClient = JamfProClient(
             server=jamfURL,
             credentials=ApiClientCredentialsProvider(jamfClientID, jamfClientSecret),
-            session_config=SessionConfig(**{"timeout": 30, "max_retries": 3}),
+            session_config=SessionConfig(
+                **{"timeout": 30, "max_retries": 5, "max_concurrency": 25}
+            ),
         )
 
     ## Make sure DDM updates are enabled on the jamf tenant
@@ -1737,6 +1788,7 @@ def run():
 
     logging.info("Parsing the latest SOFA feed for macOS updates...")
 
+    outdatedDevices = []
     updateData = getVersionData()
     createdPlans = []
     existingPlans = []
@@ -1797,10 +1849,14 @@ def run():
 ## Configured Options:
 - jamf URL: {jamfURL}
 - Target Version Type: {targetVersionType}
-- Latest macOS Version {targetVersionString}
-- Dry Run: {dryrun}
-
+- Latest macOS Version: {targetVersionString}
 """
+
+    if targetVersionType == "MINOR":
+        runSummary = (
+            runSummary + f"- Latest N-1 macOS Version: {latestPriorVersionString}\n"
+        )
+
     if excludedGroupName:
         runSummary = runSummary + f"- Excluded Group: {excludedGroupName}\n"
 
@@ -1817,6 +1873,8 @@ def run():
 
 """
         )
+
+    runSummary = runSummary + f"- Dry Run: {dryrun}\n\n"
 
     if checkPlans or retryPlans:
         runSummary = (
@@ -1989,9 +2047,37 @@ def run():
     logging.info(
         f"Retrieving list of devices not running at least macOS {targetVersionString}..."
     )
-    outdatedDevicesFilter = FilterField("general.remoteManagement.managed").eq(
-        True
-    ) & FilterField("operatingSystem.version").lt(targetVersionString)
+    if targetVersionType == "MINOR":
+        outdatedDevicesFilter = filter_group(
+            FilterField("general.remoteManagement.managed").eq(True)
+        ) & filter_group(
+            filter_group(
+                FilterField("operatingSystem.version").eq(
+                    str(Version(targetVersionString).major) + ".*"
+                )
+                & FilterField("operatingSystem.version").lt(targetVersionString)
+            )
+            | filter_group(
+                FilterField("operatingSystem.version").eq(
+                    str(Version(latestPriorVersionString).major) + ".*"
+                )
+                & FilterField("operatingSystem.version").lt(latestPriorVersionString)
+            )
+        )
+    elif targetVersionType == "MAJOR":
+        outdatedDevicesFilter = filter_group(
+            FilterField("general.remoteManagement.managed").eq(True)
+        ) & filter_group(
+            FilterField("operatingSystem.version").eq(
+                str(Version(targetVersionString).major) + ".*"
+            )
+            & FilterField("operatingSystem.version").lt(targetVersionString)
+        )
+    else:
+        outdatedDevicesFilter = FilterField("general.remoteManagement.managed").eq(
+            True
+        ) & FilterField("operatingSystem.version").lt(targetVersionString)
+
     outdatedDevices = jamfClient.pro_api.get_computer_inventory_v1(
         sections=[
             "GENERAL",
@@ -2003,7 +2089,6 @@ def run():
         filter_expression=outdatedDevicesFilter,
         return_generator=False,
     )
-    logging.info(f"Found {len(outdatedDevices)} outdated devices")
 
     ## if any group operations are being done, filter results accordingly
     if groupData := fetchComputerGroupData(groupName=excludedGroupName):
@@ -2126,9 +2211,9 @@ def run():
     ## filter out ineligible devices
     logging.info("Verifying update deployment eligibility for in-scope devices...")
     ineligibleDevices = []
+    popIndices = []
     for device in outdatedDevices:
-        popIndices = []
-        if not any([checkDeviceDDMEligible(device), checkModelSupported(device)]):
+        if not all([checkDeviceDDMEligible(device), checkModelSupported(device)]):
             ineligibleDevices.append(device.id)
             if deviceIndex := next(
                 (
@@ -2143,9 +2228,9 @@ def run():
                 )
                 popIndices.append(deviceIndex)
 
-    if ineligibleDevices:
+    if len(ineligibleDevices) > 0:
         logging.warning(
-            f"Found {len(ineligibleDevices)} devices ineligible for DDM update deployment. See run summary for details.\n\nDeployment will proceed to {len(outdatedDevices)} devices."
+            f"Found {len(ineligibleDevices)} devices ineligible for DDM update deployment. See run summary for details.\nDeployment will proceed to remaining eligible devices.\n"
         )
         for i in sorted(popIndices, reverse=True):
             outdatedDevices.pop(i)
@@ -2154,9 +2239,11 @@ def run():
 
     ## if MINOR deployment, split out results between N major version and N-1
     if targetVersionType == "MINOR":
-        logging.info("Splitting target device list to N and N-1 major versions...")
         currentMajorVersion = Version(targetVersionString).major
         priorMajorVersion = Version(latestPriorVersionString).major
+        logging.info(
+            f"Splitting target device list to N ({currentMajorVersion}) and N-1 ({priorMajorVersion}) major versions..."
+        )
 
         currentMajorTargets = []
         priorMajorTargets = []
@@ -2169,10 +2256,17 @@ def run():
                 currentMajorTargets.append(device)
 
             elif Version(device.operatingSystem.version).major == priorMajorVersion:
-                logging.debug(
-                    f"Adding device {device.id} to prior major version targets..."
-                )
-                priorMajorTargets.append(device)
+                if Version(device.operatingSystem.version) < Version(
+                    latestPriorVersionString
+                ):
+                    logging.debug(
+                        f"Adding device {device.id} to prior major version targets..."
+                    )
+                    priorMajorTargets.append(device)
+                else:
+                    logging.debug(
+                        f"Device {device.id} appears to already be up to date with the latest version of N-1."
+                    )
 
             else:
                 logging.warning(
@@ -2180,14 +2274,27 @@ def run():
                 )
                 priorMajorTargets.append(device)
 
+        logging.info(
+            f"Found {len(currentMajorTargets)} eligible devices requiring an update for macOS {currentMajorVersion}"
+        )
+        logging.info(
+            f"Found {len(priorMajorTargets)} eligible devices requiring an update for macOS {priorMajorVersion}"
+        )
+
     else:
+        currentMajorTargets = [
+            device
+            for device in outdatedDevices
+            if Version(device.operatingSystem.version) < Version(targetVersionString)
+        ]
+        logging.info(f"Found {len(currentMajorTargets)} outdated devices")
         logging.info(
             f"Sending the latest and greatest from Cuptertino to all in-scope devices..."
         )
 
     ## send plans
     planData = dict()
-    if targetVersionType == "MINOR" and priorMajorTargets:
+    if targetVersionType == "MINOR" and len(priorMajorTargets) > 0:
         installDeadlineString = calculateDeadlineString(latestPriorDeadlineDays)
         if planSuccessData := sendDeclaration(
             objectType="computer",
@@ -2228,8 +2335,6 @@ def run():
 
         elif not dryrun:
             logging.error("Something went wrong sending this plan")
-    else:
-        currentMajorTargets = outdatedDevices
 
     installDeadlineString = calculateDeadlineString(deadlineDays)
     if planSuccessData := sendDeclaration(
@@ -2278,12 +2383,14 @@ def run():
 ## Run Results:
 - Total outdated devices in scope: {len(outdatedDevices)}
 - Devices ineligible for update deployment: {len(ineligibleDevices)}
-{"- Ineligible device IDs: " + ",".join(ineligibleDevices) if ineligibleDevices else ""}
+{"- Ineligible device IDs: " + ", ".join(ineligibleDevices) if ineligibleDevices else ""}
 - Devices with Existing Active Plans: {existingPlanCount}
 - Update plans created: {createdPlanCount - existingPlanCount if not dryrun else "0 (dry run)"}
 - Update plans failed: {failedPlanCount if not dryrun else "0 (dry run)"}
 
 ## Run Finished: {datetime.strftime(datetime.now(), "%Y-%m-%d %H:%M:%S")}
+
+## Full log available at {logFile}
     """
     )
 
