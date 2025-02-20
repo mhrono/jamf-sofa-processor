@@ -45,6 +45,7 @@ REQUIREMENTS:
 ACKNOWLEDGEMENTS:
 
     Big thanks to the creators and maintainers of SOFA (https://sofa.macadmins.io/), without whom this project would not be possible
+    Huge thanks as well to the creators and maintainers of jamf-pro-sdk (https://github.com/macadmins/jamf-pro-sdk-python), also without whom this project would not be possible
 
 
 OVERVIEW:
@@ -110,7 +111,7 @@ from jamf_pro_sdk.clients.pro_api.pagination import FilterField, filter_group
 from jamf_pro_sdk.clients.auth import ApiClientCredentialsProvider
 
 ## Version
-scriptVersion = "0.4"
+scriptVersion = "0.5.1"
 
 ## Arguments
 
@@ -369,6 +370,12 @@ parser.add_argument(
 )
 
 parser.add_argument(
+    "--toggleddm",
+    action="store_true",
+    help="Toggle DDM functionality off and on for the specified jamf tenant, clearing ALL existing DDM data",
+)
+
+parser.add_argument(
     "--datafile",
     nargs="?",
     type=check_path,
@@ -430,6 +437,7 @@ dataFilePath = (
 
 debug = args.debug if "debug" in args else None
 dryrun = args.dryrun if "dryrun" in args else False
+toggleDDM = args.toggleddm if "toggleddm" in args else False
 
 ###############################
 #### Logging configuration ####
@@ -768,11 +776,8 @@ def parseVulns(cveList):
             logging.debug(
                 f"CVE {cve}: Exploitability = {exploitabilityScore}, Impact = {impactScore}"
             )
-        if cveData:
             totalExploitabilityScore += exploitabilityScore
             totalImpactScore += impactScore
-        totalExploitabilityScore += exploitabilityScore
-        totalImpactScore += impactScore
 
         if standoffTime > 0:
             logging.debug(f"Waiting {standoffTime} seconds before next request...")
@@ -850,19 +855,12 @@ def convertJamfTimestamp(timestamp):
         return None
 
     timestampSeconds = round(timestamp / 1000)
-    timeObject = datetime.fromtimestamp(timestampSeconds)
-
-    timeData = (
-        {"epochTime": timestampSeconds, "datetime": timeObject}
-        if isinstance(timestampSeconds, int)
-        else None
-    )
 
     logging.debug(
-        f"Converted timestamp {timestamp} to {timeObject.strftime("%Y-%m-%dT%H:%M:%S")} (epoch: {timestampSeconds})"
+        f"Converted timestamp {timestamp} to epoch {timestampSeconds}"
     )
 
-    return timeData
+    return timestampSeconds
 
 
 ## Given an integer, calculate an installation deadline and return it in a format acceptable to the jamf API
@@ -940,12 +938,12 @@ def checkExistingDevicePlans(deviceId, objectType="COMPUTER"):
             resource_path=f"v1/managed-software-updates/plans?filter=device.deviceId=={deviceId}",
         )
         if existingPlansResponse.ok:
-            planUUIDs = [
-                x.get("planUuid") for x in existingPlansResponse.json().get("results")
+            devicePlanRecords = [
+                getPlanData(x.get("planUuid"))
+                for x in existingPlansResponse.json().get("results")
             ]
-            planRecords = map(getPlanData, planUUIDs)
             existingActivePlanData = next(
-                (plan for plan in planRecords if not plan.get("planFailed")),
+                (plan for plan in devicePlanRecords if not plan.get("planFailed")),
                 None,
             )
             existingActivePlan = bool(existingActivePlanData)
@@ -956,19 +954,22 @@ def checkExistingDevicePlans(deviceId, objectType="COMPUTER"):
             logging.debug(
                 f"Received {existingPlansResponse.status_code} checking for plan events, trying again..."
             )
-            continue
 
     if not existingActivePlan:
         declarationItem = {"deviceId": deviceId, "objectType": objectType}
-        return declarationItem
+        returnData = {"isEligible": True, "item": declarationItem}
+        logging.debug(f"No existing plan found, returning device data: {returnData}")
+        return returnData
     else:
         existingPlanCount += 1
         existingActivePlan = {
             "planId": existingActivePlanData.get("planUuid"),
-            "device": existingActivePlanData.get("device"),
+            "device": existingActivePlanData.get("deviceData"),
         }
+        returnData = {"isEligible": False, "item": existingActivePlan}
+        logging.debug(f"Existing plan found, returning device data: {returnData}")
         existingPlans.append(existingActivePlan)
-        return None
+        return returnData
 
 
 ## Send DDM update plans to a device, a list of devices, or a group
@@ -1037,12 +1038,24 @@ def sendDeclaration(objectType, objectIds, installDeadlineString, osVersion):
                     targetDeviceList.append(deviceConfig)
 
     ## Check devices in target list for existing non-failed plans in progress
-    eligibleTargetDevices = jamfClient.concurrent_api_requests(
+    targetDeviceEligibility = jamfClient.concurrent_api_requests(
         checkExistingDevicePlans,
         [device for device in targetDeviceList],
     )
 
-    objectConfig = {"devices": [device for device in eligibleTargetDevices if device]}
+    objectConfig = {"devices": []}
+
+    existingPlanData = []
+
+    for device in targetDeviceEligibility:
+        if isinstance(device, dict):
+            if device.get("isEligible"):
+                objectConfig["devices"].append(device.get("item"))
+            else:
+                existingPlanData.append(device.get("item"))
+        else:
+            logging.debug(f"Something went wrong checking eligiblity for device: {device}")
+
     targetDeviceCount = len(objectConfig.get("devices"))
 
     if not targetDeviceCount:
@@ -1052,6 +1065,7 @@ def sendDeclaration(objectType, objectIds, installDeadlineString, osVersion):
     logging.info(
         f"Sending DDM update for macOS {osVersion} to object type {objectType} ({str(targetDeviceCount) + " devices" if objectType != "GROUP" else "id: " + objectIds}) with a {installDeadlineString} deadline..."
     )
+    logging.info(f"In-scope devices with existing plans in progress: {len(existingPlanData)}")
 
     delcarationConfig = {
         "config": {
@@ -1074,8 +1088,9 @@ def sendDeclaration(objectType, objectIds, installDeadlineString, osVersion):
         if declarationResult.status_code == 201:
             logging.info("macOS update declaration was successfully sent")
             planList = declarationResult.json().get("plans")
-            if existingPlans:
-                planList.extend(existingPlans)
+
+            if existingPlanData:
+                planList.extend(existingPlanData)
 
             return planList
 
@@ -1259,6 +1274,12 @@ def determineDeadline(cveList, exploitedCVEs):
     elif customDeadline:
         logging.warning(
             "A custom deadline has been specified for this run. CVE checking will be skipped."
+        )
+        deadlineDays = standardDays
+    
+    else:
+        logging.info(
+            "No CVEs listed for this release, proceeding with standard update deadline."
         )
         deadlineDays = standardDays
 
@@ -1466,12 +1487,12 @@ def getPlanData(planUUID):
                 for i in planEvents
                 if i.get("type") == ".PlanCreatedEvent"
             )
-            planCreatedTimestamp = convertJamfTimestamp(planCreatedJamf)
-            if planCreatedTimestamp:
-                planCreatedEpoch = planCreatedTimestamp.get("epochTime")
-            else:
-                logging.error("Failed to convert Jamf timestamp, exiting!")
-                return None
+            if not planCreatedJamf:
+                logging.debug("Plan creation event not found, trying again...")
+                continue
+
+            planCreatedEpoch = convertJamfTimestamp(planCreatedJamf)
+            logging.debug(f"Plan created at {planCreatedEpoch}")
             break
 
     ## Full plan info might not be available until after declarations and events have been recorded
@@ -1551,12 +1572,13 @@ def getPlanData(planUUID):
         if declarationConfiguration:
             configurationJson = json.loads(declarationConfiguration)
             targetVersionString = configurationJson.get("TargetOSVersion")
-            deviceUpdated = bool(
-                Version(deviceCurrentOSVersion) >= Version(targetVersionString)
-            )
         else:
-            targetVersionString = None
-            deviceUpdated = False
+            targetVersionString = planInfo.get("specificVersion")
+
+        deviceUpdated = bool(
+            Version(deviceCurrentOSVersion) >= Version(targetVersionString)
+        )
+        
         planData = {
             "planUuid": planUUID,
             "planCreated": planCreatedEpoch,
@@ -1688,6 +1710,93 @@ def retryPlan(plan):
     logging.info(f"Successfully created a new plan for device {deviceId}: {newPlanId}")
     return newPlanData
 
+## Get DDM feature toggle status
+def getDDMStatus():
+    """
+    Retrieves the status of the DDM (Device Deployment Management) feature toggle from the Jamf API.
+    This function sends a GET request to the Jamf API to check the status of the DDM feature toggle.
+    If the request is successful, it returns the toggle status. If the request fails, it logs an error
+    message and returns None.
+    Returns:
+        bool: The status of the DDM feature toggle if the request is successful.
+        None: If the request fails or an error occurs.
+    """
+
+    toggleCheckResponse = jamfClient.pro_api_request(
+        method="GET", resource_path="v1/managed-software-updates/plans/feature-toggle"
+    )
+    
+    if toggleCheckResponse.ok:
+        return toggleCheckResponse.json().get("toggle")
+    else:
+        logging.error(
+            f"Failed to retrieve DDM feature toggle status. Received {toggleCheckResponse.status_code} from jamf API: {toggleCheckResponse.content}"
+        )
+        return None
+
+## Toggle DDM feature
+def toggleDDMFeature(desiredState):
+    """
+    Toggles the DDM (Device Deployment Management) feature on or off in the Jamf API.
+
+    Parameters:
+    toggleOption (bool): The desired state of the DDM feature toggle. True to enable, False to disable.
+
+    Returns:
+    None
+    """
+
+    toggleDDMResponse = jamfClient.pro_api_request(
+        method="PUT",
+        resource_path="v1/managed-software-updates/plans/feature-toggle",
+        data={"toggle": desiredState},
+    )
+    if toggleDDMResponse.ok:
+        logging.info(f"Successfully toggled DDM updates to {desiredState}")
+        monitorDDMStatus("toggleOn" if desiredState else "toggleOff")
+    else:
+        logging.error(
+            f"Failed to toggle DDM updates to {desiredState}. Received {toggleDDMResponse.status_code} from jamf API: {toggleDDMResponse.content}"
+        )
+        return None
+
+## Monitor DDM feature toggle status
+def monitorDDMStatus(toggleOption):
+    """
+    Monitors the status of the Declarative Device Management (DDM) feature toggle.
+
+    This function continuously checks the status of the DDM feature toggle and logs the status.
+    It runs indefinitely until the script is manually stopped.
+
+    Logs:
+        - Logs the status of the DDM feature toggle.
+        - Logs an error message if the API request fails.
+    """
+
+    time.sleep(1)
+
+    while True:
+        toggleCheckResponse = jamfClient.pro_api_request(
+            method="GET", resource_path="v1/managed-software-updates/plans/feature-toggle/status"
+        ).json()
+        toggleStateData = toggleCheckResponse.get(toggleOption)
+        if toggleStateData.get("state") == "RUNNING":
+            logging.info(f"Toggle operation in progress: {toggleStateData.get("formattedPercentComplete")}")
+        else:
+            desiredToggleState = True if toggleOption == "toggleOn" else False
+            if getDDMStatus() == desiredToggleState:
+                logging.info(f"Successfully toggled DDM updates to {desiredToggleState}")
+                break
+            elif failReason := toggleStateData.get("exitMessage"):
+                logging.error(f"Failed to toggle DDM updates to {desiredToggleState}: {failReason}")
+                endRun(1, "critical", "Failed to toggle DDM updates")
+            else:
+                logging.error("Unknown issue encountered attempting to toggle DDM functionality")
+                endRun(1, "critical", "Failed to toggle DDM updates")
+        
+        time.sleep(3)
+
+    return
 
 ## Do the things
 def run():
@@ -1746,17 +1855,17 @@ def run():
 
     ## Make sure DDM updates are enabled on the jamf tenant
     logging.debug("Checking to ensure DDM updates are enabled...")
-    toggleCheckResponse = jamfClient.pro_api_request(
-        method="GET", resource_path="v1/managed-software-updates/plans/feature-toggle"
-    ).json()
-    if toggleCheckResponse.get("toggle", None) == True:
+    if getDDMStatus():
         logging.debug("DDM updates are enabled")
     else:
-        endRun(
-            1,
-            logLevel="critical",
-            message="DDM updates do not appear to be enabled on this jamf tenant. Please check your settings and try again.",
-        )
+        logging.warning("DDM updates do not appear to be enabled on this jamf tenant. Attempting to enable...")
+        toggleDDMFeature(True)
+
+    ## Toggle DDM functionality on the jamf tenant if specified
+    if toggleDDM:
+        logging.info("Toggling DDM updates on the jamf tenant...")
+        toggleDDMFeature(False)
+        toggleDDMFeature(True)
 
     if dataFilePath.exists():
         logging.info(f"Found metadata file at {dataFilePath}, processing...")
@@ -2170,6 +2279,7 @@ def run():
                     outdatedDevices.pop(i)
             logging.info(f"Filtered to {len(outdatedDevices)} outdated devices")
             deadlineDays = canaryDays
+            logging.info(f"Setting deadline to {deadlineDays} days for canary deployment")
             isCanary = True
 
         else:
@@ -2295,6 +2405,7 @@ def run():
     ## send plans
     planData = dict()
     if targetVersionType == "MINOR" and len(priorMajorTargets) > 0:
+        priorCreatedPlans = []
         installDeadlineString = calculateDeadlineString(latestPriorDeadlineDays)
         if planSuccessData := sendDeclaration(
             objectType="computer",
@@ -2302,14 +2413,17 @@ def run():
             installDeadlineString=installDeadlineString,
             osVersion=latestPriorVersionString,
         ):
-
             for plan in jamfClient.concurrent_api_requests(
                 getPlanData, [p.get("planId") for p in planSuccessData]
             ):
-                createdPlans.append(plan)
-                createdPlanCount += 1
                 if plan.get("planFailed"):
-                    failedPlanCount += 1
+                    if "EXISTING_PLAN_FOR_DEVICE_IN_PROGRESS" in plan.get("planErrors"):
+                        existingPlanCount += 1
+                    else:
+                        failedPlanCount += 1
+                else:
+                    priorCreatedPlans.append(plan)
+                    createdPlanCount += 1
 
             priorPlanData = {
                 "prior": {
@@ -2326,7 +2440,7 @@ def run():
                                 )
                             )
                         ),
-                        "plans": createdPlans,
+                        "plans": priorCreatedPlans,
                     }
                 }
             }
@@ -2336,6 +2450,7 @@ def run():
         elif not dryrun:
             logging.error("Something went wrong sending this plan")
 
+    createdPlans = []
     installDeadlineString = calculateDeadlineString(deadlineDays)
     if planSuccessData := sendDeclaration(
         objectType="computer",
@@ -2343,13 +2458,20 @@ def run():
         installDeadlineString=installDeadlineString,
         osVersion=targetVersionString,
     ):
-
         for plan in jamfClient.concurrent_api_requests(
             getPlanData, [p.get("planId") for p in planSuccessData]
         ):
-            createdPlans.append(plan)
-            createdPlanCount += 1
-            if plan.get("planFailed"):
+            if isinstance(plan, dict):
+                if plan.get("planFailed"):
+                    if "EXISTING_PLAN_FOR_DEVICE_IN_PROGRESS" in plan.get("planErrors"):
+                        existingPlanCount += 1
+                    else:
+                        failedPlanCount += 1
+                else:
+                    createdPlans.append(plan)
+                    createdPlanCount += 1
+            else:
+                logging.error("Failed to retrieve plan data for this plan, marking as failed")
                 failedPlanCount += 1
 
         latestPlanData = {
@@ -2385,7 +2507,7 @@ def run():
 - Devices ineligible for update deployment: {len(ineligibleDevices)}
 {"- Ineligible device IDs: " + ", ".join(ineligibleDevices) if ineligibleDevices else ""}
 - Devices with Existing Active Plans: {existingPlanCount}
-- Update plans created: {createdPlanCount - existingPlanCount if not dryrun else "0 (dry run)"}
+- Update plans created: {createdPlanCount if not dryrun else "0 (dry run)"}
 - Update plans failed: {failedPlanCount if not dryrun else "0 (dry run)"}
 
 ## Run Finished: {datetime.strftime(datetime.now(), "%Y-%m-%d %H:%M:%S")}
