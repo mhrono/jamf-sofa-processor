@@ -24,6 +24,7 @@ In order for this script to run successfully, you'll need the following:
 ## Acknowledgements
 
 Big thanks to the creators and maintainers of SOFA (https://sofa.macadmins.io/), without whom this project would not be possible
+Huge thanks as well to the creators and maintainers of jamf-pro-sdk (https://github.com/macadmins/jamf-pro-sdk-python), also without whom this project would not be possible
 
 ## Known Issues/Deficiencies
 
