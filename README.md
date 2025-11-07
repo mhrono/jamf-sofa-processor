@@ -29,16 +29,19 @@ Huge thanks as well to the creators and maintainers of jamf-pro-sdk (https://git
 ## Known Issues/Deficiencies
 
 - This script is currently hardcoded for macOS updates only. It could be modified to also support updating iOS devices. I may do this in the future, but it is not currently planned.
-- The sendNotifications function is planned but not currently implemented.
 - The `--check` and `--retry` arguments have not been tested and may not be functional. Use at your own risk.
 - Canary --> general deployment flows have not been tested and may not be functional. Use at your own risk.
 
 ## Usage
 
 ### I don't want to read docs. Just tell me how to make it go.
-The only required arguments are your jamf URL and credentials. This will YOLO the shiniest release from Cupertino to all eligible devices.
+The only required arguments are your Jamf URL and credentials. This will YOLO the shiniest release from Cupertino to all eligible devices with a 14-day deadline.
 
-With that said, I recommend at least checking out the `--targetversion` argument for a bit more control.
+Everything else is optional, but at minimum I'd suggest checking out `--targetversion` for version control, `--deadline` if you're feeling spicy, and maybe `--excludegroup` if you've got conference room devices or similar that shouldn't auto-update.
+
+Want Slack notifications? Toss in `--notificationtype SLACK`, `--notificationurl <webhook>`, and `-o slack_token=<token>`. Details below.
+
+Running this in Lambda? Set your args as environment variables and you're golden. The script handles read-only filesystems automatically.
 
 ### Arguments
 
@@ -61,8 +64,7 @@ _CVE Checking_
 - `--vulnchecktoken`: API key for VulnCheck (https://vulncheck.com)
 
 _SOFA Options_
-- `--feedsource`: Full path or URL to a SOFA-generated macos_data_feed.json file. Defaults to https://sofafeed.macadmins.io/v1/macos_data_feed.json
-- `--timestamp`: Full path or URL to a SOFA-generated timestamp.json file. Defaults to https://sofafeed.macadmins.io/v1/timestamp.json
+- `--feedsource`: Full path or URL to a SOFA v2 macos_data_feed.json file. Defaults to https://sofa.macadmins.io/v2/macos_data_feed.json
 
 _Target macOS Version_
 - `--targetversion`: Target macOS version for deployment. Can be any of the following:
@@ -89,10 +91,10 @@ _Deadline Options_
 - __Not Implemented__ `--force`: Force the update to all outdated devices with the specified deadline (in days), overriding any configured canary data
 
 _Notification Options_
-- `notificationtype`: Type of notification to send, "SLACK" is currently the only available option.
-- `notificationurl`: Notification URL, currently only supports a Slack webhook URL
-- `notificationtemplate`: Customizable message to send to users via the notification
-- `notificationoptions`: Notification options, certain fields must be sent using this arg in order to use notifications.  For Slack "slack_token" must be provided using this field.
+- `--notificationtype`: Type of notification to send. "SLACK" is currently the only available option.
+- `--notificationurl`: Notification URL. Currently only supports a Slack webhook URL.
+- `--notificationtemplate`: Customizable message to send to users via the notification (Default: ", please attend to your device upgrade")
+- `-o` / `--notificationoptions`: Notification options in key=value format. For Slack, you must provide `slack_token=<your_token>`. Can be specified multiple times or set via environment variable as comma-delimited string.
 
 _Other Arguments_
 - `--debug`: Enable debug logging for this script
@@ -152,13 +154,48 @@ The great thing about using DDM for macOS update enforcement is that anything us
 Apple's [Platform Deployment Guide](https://support.apple.com/guide/deployment/installing-and-enforcing-software-updates-depd30715cbb/1/web/1.0) has a great overview of what users should expect to see when DDM update declarations have been sent to their device. Check out the `Enforcing software updates` section for a really useful flowchart detailing when and how often users are notified about an upcoming deadline.
 
 ## Notifications
-The current implementation will send a notification that mentions users by name.  This can be used to reinforce the plan sent via Jamf, to warn users that a forced update is coming, and so on using the notificationTemplate.
 
-### Slack Notifications
-You must create a Slack app in order to make use of the Slack notifications.  Navigate to [https://api.slack.com/apps](https://api.slack.com/apps).  Give your app a name and select your Slack workspace.  Under "OAuth and Permissions" find the "Scopes" section and grant "users:read.email" and "users:read" under Bot Token Scopes.  The Slack token you need to provide to the script is available a bit higher up the same page under "OAuth Tokens".  Then navigate to "Incoming Webhooks" and click "On" for "Activate Incoming Webhooks".  Once it is enabled, add a webhook by clicking the button under "Webhook URLs for your Workspace".  Use this webhook URL as the notificationurl for this script.  Finally, make sure your app is installed to the desired channel by clicking "Install App" and installing it to the workspace.
+The script can send Slack notifications that mention affected users by name when update plans are deployed. This is useful for reinforcing the DDM update plan, providing advance warning, or just keeping users in the loop.
+
+### Slack Setup
+
+To enable Slack notifications, you'll need to create a Slack app:
+
+1. Navigate to [https://api.slack.com/apps](https://api.slack.com/apps)
+2. Create a new app with a name of your choosing and select your workspace
+3. Under **OAuth & Permissions**:
+   - Add these Bot Token Scopes: `users:read.email` and `users:read`
+   - Copy the **Bot User OAuth Token** (starts with `xoxb-`) - you'll need this for `--notificationoptions`
+4. Under **Incoming Webhooks**:
+   - Toggle **Activate Incoming Webhooks** to **On**
+   - Click **Add New Webhook to Workspace**
+   - Select the channel where notifications should be posted
+   - Copy the webhook URL - you'll need this for `--notificationurl`
+5. Install the app to your workspace
+
+**Example Usage:**
+```bash
+--notificationtype SLACK \
+--notificationurl https://hooks.slack.com/services/YOUR/WEBHOOK/URL \
+-o slack_token=xoxb-your-bot-token \
+--notificationtemplate ", your Mac needs an update. Please save your work!"
+```
 
 ## Lambda Support
-This script can be used as a Lambda function.  You will need to pass in the arguments as environment variables to the script under Configuration.
+
+This script works great as an AWS Lambda function - perfect for scheduled automated deployments.
+
+**Environment Variables:**
+Instead of command-line arguments, set these as Lambda environment variables:
+- `jamfURL`, `jamfClientID`, `jamfClientSecret` (required)
+- `updaterTargetVersion`, `updaterDeadline`, `updaterExcludeGroup`, `updaterOverrideGroup` (optional)
+- `notificationURL`, `notificationType`, `notificationTemplate`, `notificationOptions` (optional)
+- `nvdToken`, `vulncheckToken` (optional)
+- `dataFile` (optional, defaults to `/tmp/updatePlanData.json`)
+
+The script automatically detects read-only filesystems and adjusts logging accordingly. Just set it up, configure your schedule, and forget about it.
+
+**Big thanks to [@sarasensible](https://github.com/sarasensible) for the Lambda support and notification features!**
 
 ## Bugs and Feature Requests
 
