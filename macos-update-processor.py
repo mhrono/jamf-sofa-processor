@@ -115,7 +115,7 @@ from jamf_pro_sdk.clients.pro_api.pagination import FilterField, filter_group
 from jamf_pro_sdk.clients.auth import ApiClientCredentialsProvider
 
 ## Version
-scriptVersion = "0.5.1"
+scriptVersion = "0.7.0"
 
 ## Arguments
 
@@ -259,20 +259,11 @@ parser.add_argument(
 
 parser.add_argument(
     "--feedsource",
-    default="https://sofafeed.macadmins.io/v1/macos_data_feed.json?",
-    const="https://sofafeed.macadmins.io/v1/macos_data_feed.json?",
+    default="https://sofa.macadmins.io/v2/macos_data_feed.json?",
+    const="https://sofa.macadmins.io/v2/macos_data_feed.json?",
     nargs="?",
     metavar="URL or path",
-    help="Full path or URL to a SOFA-generated macos_data_feed.json file. Defaults to https://sofafeed.macadmins.io/v1/macos_data_feed.json",
-)
-
-parser.add_argument(
-    "--timestamp",
-    default="https://sofafeed.macadmins.io/v1/timestamp.json?",
-    const="https://sofafeed.macadmins.io/v1/timestamp.json?",
-    nargs="?",
-    metavar="URL or path",
-    help="Full path or URL to a SOFA-generated timestamp.json file. Defaults to https://sofafeed.macadmins.io/v1/timestamp.json",
+    help="Full path or URL to a SOFA-generated macos_data_feed.json file. Defaults to https://sofa.macadmins.io/v2/macos_data_feed.json",
 )
 
 parser.add_argument(
@@ -575,7 +566,7 @@ def endRun(exitCode=None, logLevel="info", message=None):
     logCmd = getattr(logging, logLevel, logging.info)
     if message:
         logCmd(message)
-    return(exitCode)
+    sys.exit(exitCode)
 
 
 ## Load feed file
@@ -595,35 +586,6 @@ if feedSource := args.feedsource:
 
 else:
     endRun(1, "critical", "Unknown issue encountered fetching feed data, exiting...")
-
-## Load timestamp data
-if timestampSource := args.timestamp:
-    logging.debug(
-        f"Attempting to fetch SOFA feed timestamp data from {timestampSource}..."
-    )
-
-    try:
-        if timestampSource.startswith("http://") or timestampSource.startswith(
-            "https://"
-        ):
-            timestampData = json.loads(requests.get(timestampSource).content)
-
-        elif Path(timestampSource).exists():
-            timestampData = json.loads(Path(timestampSource).read_text())
-
-        logging.debug("Successfully retrieved timestamp data")
-
-    except:
-        endRun(
-            1,
-            "critical",
-            f"Failed to fetch timestamp data from {timestampSource}, exiting!",
-        )
-
-else:
-    endRun(
-        1, "critical", "Unknown issue encountered fetching timestamp data, exiting..."
-    )
 
 
 ## Load and return data from a json file
@@ -915,38 +877,19 @@ def parseVulns(cveList):
             totalImpactScore += impactScore
 
         if standoffTime > 0:
+
             logging.debug(f"Waiting {standoffTime} seconds before next request...")
             time.sleep(standoffTime)
+            
     if cveCount > 0:
         averageExploitabilityScore = round(totalExploitabilityScore / cveCount, 1)
-        if cveCount > 0:
-            averageExploitabilityScore = round(totalExploitabilityScore / cveCount, 1)
-            averageImpactScore = round(totalImpactScore / cveCount, 1)
-        else:
-            averageExploitabilityScore = 0
-            averageImpactScore = 0
-
-        logging.debug(f"Average exploitability score: {averageExploitabilityScore}")
-        logging.debug(f"Average impact score: {averageImpactScore}")
-
-        if averageExploitabilityScore > 6:
-            logging.info(
-                f"Average exploitability score {averageExploitabilityScore} exceeds the threshold of 6--forcing shorter installation deadline!"
-            )
-            return True
-        elif averageImpactScore > 8:
-            logging.info(
-                f"Average impact score {averageImpactScore} exceeds the threshold of 8--forcing shorter installation deadline!"
-            )
-            return True
-        else:
-            logging.info(
-                "Average exploitability and impact scores are within normal risk ranges. No accelerated deadline required."
-            )
-            return False
+        averageImpactScore = round(totalImpactScore / cveCount, 1)
     else:
-        logging.debug(f"Average exploitability score: {averageExploitabilityScore}")
-        logging.debug(f"Average impact score: {averageImpactScore}")
+        averageExploitabilityScore = 0
+        averageImpactScore = 0
+
+    logging.debug(f"Average exploitability score: {averageExploitabilityScore}")
+    logging.debug(f"Average impact score: {averageImpactScore}")
 
     EXPLOITABILITY_THRESHOLD = 6
     IMPACT_THRESHOLD = 8
@@ -1933,6 +1876,37 @@ def monitorDDMStatus(toggleOption):
 
     return
 
+## Initialize jamf client
+def initializeJamfClient():
+    """
+    Initializes the Jamf Pro API client with the provided credentials and server URL.
+
+    This function sets up the JamfProClient with the necessary credentials and session configuration.
+    It checks if the required credentials are provided and raises an error if they are not.
+
+    Returns:
+        JamfProClient: An instance of the JamfProClient configured with the provided credentials and server URL.
+
+    Raises:
+        Exception: If the Jamf Pro URL or credentials are not provided.
+    """
+    global jamfClient
+
+    if not all([jamfURL, jamfClientID, jamfClientSecret]):
+        endRun(1, "critical", "Jamf Pro URL and/or credentials not found!")
+
+    logging.info("Initializing Jamf Pro API client...")
+
+    jamfClient = JamfProClient(
+        server=jamfURL,
+        credentials=ApiClientCredentialsProvider(jamfClientID, jamfClientSecret),
+        session_config=SessionConfig(
+            **{"timeout": 30, "max_retries": 5, "max_concurrency": 25}
+        ),
+    )
+
+    jamfClient.get_access_token()
+
 ## Do the things - event and context can optionally be passed in case of invoking from Lambda
 def run(event=None, context=None):
     """
@@ -1965,6 +1939,7 @@ def run(event=None, context=None):
     """
 
     ## Declare global args
+    global jamfClient
     global outdatedDevices
     global canaryGroupName
     global existingPlanCount
@@ -1974,19 +1949,7 @@ def run(event=None, context=None):
     logging.debug("Validating run conditions...")
 
     ## Configure the jamf API client
-    if not all([jamfURL, jamfClientID, jamfClientSecret]):
-        endRun(1, "critical", "Jamf Pro URL and/or credentials not found!")
-
-    else:
-        global jamfClient
-
-        jamfClient = JamfProClient(
-            server=jamfURL,
-            credentials=ApiClientCredentialsProvider(jamfClientID, jamfClientSecret),
-            session_config=SessionConfig(
-                **{"timeout": 30, "max_retries": 5, "max_concurrency": 25}
-            ),
-        )
+    initializeJamfClient()
 
     ## Make sure DDM updates are enabled on the jamf tenant
     logging.debug("Checking to ensure DDM updates are enabled...")
@@ -1997,7 +1960,7 @@ def run(event=None, context=None):
         toggleDDMFeature(True)
 
     ## Toggle DDM functionality on the jamf tenant if specified
-    if toggleDDM:
+    if toggleDDM and not dryrun:
         logging.info("Toggling DDM updates on the jamf tenant...")
         toggleDDMFeature(False)
         toggleDDMFeature(True)
@@ -2009,7 +1972,7 @@ def run(event=None, context=None):
     else:
         currentPlanData = None
 
-    lastRunTime = timestampData.get("macOS").get("LastCheck").replace("Z", "")
+    lastRunTime = feedData.get("LastCheck").replace("Z", "")
     currentEpochTime = int(datetime.now(timezone.utc).strftime("%s"))
     lastRunTimeEpoch = int(datetime.fromisoformat(lastRunTime).strftime("%s"))
     runDelta = currentEpochTime - lastRunTimeEpoch
@@ -2017,17 +1980,6 @@ def run(event=None, context=None):
     if runDelta >= 604800:
         logging.warning(
             f"The current run data is over a week old. Ensure the data feed builder is running properly."
-        )
-
-    timestampHash = timestampData.get("macOS").get("UpdateHash")
-    dataHash = feedData.get("UpdateHash")
-
-    ## Fail out if the hashes don't match
-    if timestampHash != dataHash:
-        endRun(
-            1,
-            logLevel="critical",
-            message=f"Feed data hash {dataHash} does not match hash found in timestamp data ({timestampHash})! Verify your SOFA feed.",
         )
 
     logging.info("Parsing the latest SOFA feed for macOS updates...")
@@ -2078,6 +2030,9 @@ def run(event=None, context=None):
         logging.info(f"Forced update detected--setting deadline of {forceDays} days")
         deadlineDays = forceDays
         canaryGroupName = None
+
+    ## Re-initialize jamf api client to make sure we have a valid token
+    initializeJamfClient()
 
     ## Begin generating run summary
     createdPlanCount = 0
@@ -2325,7 +2280,6 @@ def run(event=None, context=None):
     outdatedDevices = jamfClient.pro_api.get_computer_inventory_v1(
         sections=[
             "GENERAL",
-            "USER_AND_LOCATION",
             "HARDWARE",
             "OPERATING_SYSTEM",
             "SECURITY",
@@ -2540,6 +2494,22 @@ def run(event=None, context=None):
 
     ## send plans
     planData = dict()
+    
+    # Load existing metadata to preserve canary data when writing standard deployment
+    if dataFilePath.exists():
+        logging.debug("Loading existing metadata to preserve structure...")
+        try:
+            existingMetadata = loadJson(dataFilePath)
+            if existingMetadata is not None:
+                planData = existingMetadata
+                logging.debug("Loaded existing metadata structure")
+        except (json.JSONDecodeError, FileNotFoundError, PermissionError) as e:
+            logging.warning(f"Could not load existing metadata, starting fresh: {e}")
+            planData = dict()
+        except Exception as e:
+            logging.error(f"Unexpected error loading metadata: {e}")
+            raise  # Re-raise unexpected errors
+    
     if targetVersionType == "MINOR" and len(priorMajorTargets) > 0:
         priorCreatedPlans = []
         installDeadlineString = calculateDeadlineString(latestPriorDeadlineDays)
@@ -2561,27 +2531,26 @@ def run(event=None, context=None):
                     priorCreatedPlans.append(plan)
                     createdPlanCount += 1
 
-            priorPlanData = {
-                "prior": {
-                    "canary" if isCanary else "standard": {
-                        "planCreated": datetime.strftime(
-                            datetime.now(), "%Y-%m-%dT%H:%M:%S"
-                        ),
-                        "targetVersion": latestPriorVersionString,
-                        "installationDeadline": installDeadlineString,
-                        "installationDeadlineEpoch": int(
-                            datetime.timestamp(
-                                datetime.strptime(
-                                    installDeadlineString, "%Y-%m-%dT%H:%M:%S"
-                                )
-                            )
-                        ),
-                        "plans": priorCreatedPlans,
-                    }
-                }
+            # Ensure prior structure exists
+            if "prior" not in planData:
+                planData["prior"] = {}
+            
+            # Add/update the specific deployment type (canary or standard)
+            planData["prior"]["canary" if isCanary else "standard"] = {
+                "planCreated": datetime.strftime(
+                    datetime.now(), "%Y-%m-%dT%H:%M:%S"
+                ),
+                "targetVersion": latestPriorVersionString,
+                "installationDeadline": installDeadlineString,
+                "installationDeadlineEpoch": int(
+                    datetime.timestamp(
+                        datetime.strptime(
+                            installDeadlineString, "%Y-%m-%dT%H:%M:%S"
+                        )
+                    )
+                ),
+                "plans": priorCreatedPlans,
             }
-
-            planData.update(priorPlanData)
 
         elif not dryrun:
             logging.error("Something went wrong sending this plan")
@@ -2610,27 +2579,26 @@ def run(event=None, context=None):
                 logging.error("Failed to retrieve plan data for this plan, marking as failed")
                 failedPlanCount += 1
 
-        latestPlanData = {
-            "latest": {
-                "canary" if isCanary else "standard": {
-                    "planCreated": datetime.strftime(
-                        datetime.now(), "%Y-%m-%dT%H:%M:%S"
-                    ),
-                    "targetVersion": targetVersionString,
-                    "installationDeadline": installDeadlineString,
-                    "installationDeadlineEpoch": int(
-                        datetime.timestamp(
-                            datetime.strptime(
-                                installDeadlineString, "%Y-%m-%dT%H:%M:%S"
-                            )
-                        )
-                    ),
-                    "plans": createdPlans,
-                }
-            }
+        # Ensure latest structure exists
+        if "latest" not in planData:
+            planData["latest"] = {}
+        
+        # Add/update the specific deployment type (canary or standard)
+        planData["latest"]["canary" if isCanary else "standard"] = {
+            "planCreated": datetime.strftime(
+                datetime.now(), "%Y-%m-%dT%H:%M:%S"
+            ),
+            "targetVersion": targetVersionString,
+            "installationDeadline": installDeadlineString,
+            "installationDeadlineEpoch": int(
+                datetime.timestamp(
+                    datetime.strptime(
+                        installDeadlineString, "%Y-%m-%dT%H:%M:%S"
+                    )
+                )
+            ),
+            "plans": createdPlans,
         }
-
-        planData.update(latestPlanData)
 
     elif not dryrun:
         logging.error("Something went wrong sending this plan")
