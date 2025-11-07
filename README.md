@@ -197,6 +197,17 @@ The script automatically detects read-only filesystems and adjusts logging accor
 
 **Big thanks to [@sarasensible](https://github.com/sarasensible) for the Lambda support and notification features!**
 
+## GitHub Actions Integration
+
+Want to automate macOS update deployments via CI/CD? An example GitHub Actions workflow is included that provides:
+- Scheduled SOFA feed monitoring
+- Canary deployment support  
+- Manual and automated triggers
+- Metadata caching for deployment tracking
+- Dry run and debug modes
+
+See [`GITHUB_ACTIONS_SETUP.md`](GITHUB_ACTIONS_SETUP.md) for a complete setup guide.
+
 ## Bugs and Feature Requests
 
 For any issues encountered or feature requests, please open an issue.

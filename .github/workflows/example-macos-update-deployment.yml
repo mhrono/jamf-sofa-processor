@@ -1,0 +1,631 @@
+name: Parse and Deploy macOS Updates Using DDM
+
+# This is an example workflow showing how to use macos-update-processor.py
+# in a GitHub Actions environment. Customize it for your organization's needs.
+
+on:
+
+  workflow_dispatch:
+    inputs:
+      ## Operation mode - What do you want to do?
+      operation_mode:
+        description: Operation mode for the workflow
+        required: false
+        default: 'deploy'
+        type: choice
+        options:
+          - 'deploy'           # Standard deployment (default)
+          - 'check'            # Check existing plans
+          - 'retry'            # Retry failed plans  
+          - 'check_and_retry'  # Check plans + retry failed
+          - 'report'           # Generate compliance report
+
+      ## Execution mode - How do you want to run it?
+      execution_mode:
+        description: Execution mode
+        required: false
+        default: 'normal'
+        type: choice
+        options:
+          - 'normal'      # Normal execution
+          - 'debug'       # Debug mode enabled
+          - 'dry_run'     # Dry run only
+          - 'debug_dry'   # Debug + dry run
+
+      ## Target macOS Version - What version to deploy?
+      target_macos_version:
+        description: Target macOS Version (must be one of major, minor, any, or a specific version (e.g. 15.2))
+        required: false
+        default: 'any'
+        type: string
+
+      ## Override Group Name - Target specific group?
+      override_group_name:
+        description: Override default scoping and update a specific jamf group name
+        required: false
+        type: string
+
+      ## Excluded Group Name - Exclude any groups?
+      exclude_group_name:
+        description: Exclude a specific jamf group from scheduled updates
+        required: false
+        type: string
+
+      ## Canary Group Name - Custom canary group?
+      canary_group_name:
+        description: Specify a custom canary group name
+        required: false
+        type: string
+
+      ## Force update with deadline - Skip canary and force deploy?
+      force_deadline:
+        description: Deploy the latest macOS update to all in-scope devices using the specified deadline (in days), skipping any canary group
+        required: false
+        default: 0
+        type: number
+
+      ## Canary abort - Stop in-progress canary?
+      canary_abort:
+        description: STOP an in-progress canary deployment to prevent wide deployment
+        required: false
+        default: false
+        type: boolean
+
+      ## Toggle DDM feature - Clear existing plans? (Advanced)
+      toggle_ddm:
+        description: Toggle DDM feature to clear existing plans
+        required: false
+        default: False
+        type: boolean
+
+  # Uncomment the schedule below to enable automatic runs
+  # schedule:
+  #   # Run every 6 hours: 12 AM, 6 AM, 12 PM, 6 PM UTC
+  #   # Adjust as needed for your organization
+  #   - cron: '0 */6 * * *'
+
+defaults:
+  run:
+    shell: zsh {0}
+
+jobs:
+
+  run-processor:
+      runs-on: ubuntu-22.04
+      
+      steps:
+
+        - name: Checkout repository
+          uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 #v5.0.0
+
+        - name: Setup Python
+          uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+          with:
+            python-version: '3.12'
+
+        - name: Install zsh
+          run: |
+            sudo apt install zsh -y
+          shell: bash
+
+        - name: Install dependencies
+          run: |
+            pip install -r ${{ github.workspace }}/requirements.txt
+
+        - name: Initialize script arguments
+          id: initScriptArgs
+          run: |
+            # Create cache directory for metadata storage
+            mkdir -p ${{ github.workspace }}/cache/sofa
+            metadataFile="${{ github.workspace }}/cache/updatePlanData.json"
+            scriptArgs+=("--datafile" "${metadataFile}")
+            echo "scriptArgs=${scriptArgs[@]}" >> $GITHUB_ENV
+            echo "metadataFile=$metadataFile" >> $GITHUB_ENV
+
+        - name: Set jamf credentials
+          id: setJamfCreds
+          run: |
+            # TODO: Replace these with your organization's secrets/variables
+            # Recommended approach:
+            # - Store Jamf URL in repository variables (vars.JAMF_URL)
+            # - Store Client ID and Secret in repository secrets (secrets.JAMF_CLIENT_ID, secrets.JAMF_CLIENT_SECRET)
+            
+            scriptArgs="${{ env.scriptArgs }}"
+            
+            jamfURL="${{ vars.JAMF_URL }}"
+            jamfClientID="${{ secrets.JAMF_CLIENT_ID }}"
+            jamfClientSecret="${{ secrets.JAMF_CLIENT_SECRET }}"
+            
+            ## Normalize jamfURL to remove protocol and trailing slash (if present)
+            jamfURL=$(echo "$jamfURL" | sed -E 's|^https?://||; s|/$||')
+            
+            scriptArgs+=("--jamfurl" "$jamfURL" "--clientid" "$jamfClientID" "--clientsecret" "$jamfClientSecret")
+            echo "scriptArgs=${scriptArgs[@]}" >> $GITHUB_ENV
+
+        - name: Process workflow inputs
+          id: processInput
+          run: |
+            scriptArgs="${{ env.scriptArgs }}"
+
+            ## Set default args for scheduled runs
+            if [[ "${{ github.event_name }}" == "schedule" ]]; then
+              # TODO: Customize these defaults for your organization
+              # Example: exclude conference room devices, set canary group
+              scriptArgs+=("--excludegroup" "Conference Room Devices")
+              scriptArgs+=("--canarygroup" "Update Test Group")
+            
+            else
+
+              ## Toggle DDM
+              if [[ "${{ github.event.inputs.toggle_ddm }}" == "true" ]]; then
+                echo "Clearing all existing DDM plans..."
+                scriptArgs+=("--toggleddm")
+              fi
+
+              ## Target macOS version validation
+              targetVersionCheck="${{ github.event.inputs.target_macos_version }}"
+              
+              if [[ "$targetVersionCheck" =~ ^(major|minor|any)$ ]] || [[ "$targetVersionCheck" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+                echo "✅ Valid target version: $targetVersionCheck"
+              else
+                echo "::error::Invalid target macOS version or type specified!"
+                echo "::error::Expected: major, minor, any, or version format (e.g., 15.2, 15.2.1)"
+                exit 1
+              fi
+              
+              if [[ "$targetVersionCheck" =~ ^(major|minor|any)$ ]]; then
+                targetVersionType=$(echo $targetVersionCheck | tr '[:upper:]' '[:lower:]')
+                echo "Targeting macOS version type $targetVersionType..."
+                scriptArgs+=("--targetversion" "$targetVersionType")
+              else
+                targetVersionString=$targetVersionCheck
+                targetVersionType="specific"
+                echo "Targeting specific version $targetVersionString..."
+                scriptArgs+=("--targetversion" "$targetVersionString")
+              fi
+
+              echo "targetVersionType=$targetVersionType" >> $GITHUB_OUTPUT
+              echo "targetVersionString=$targetVersionString" >> $GITHUB_OUTPUT
+
+              ## Exclude group name
+              if [[ "${{ github.event.inputs.exclude_group_name }}" != "" ]]; then
+                echo "Excluding group ${{ github.event.inputs.exclude_group_name }}..."
+                scriptArgs+=("--excludegroup" "${{ github.event.inputs.exclude_group_name }}")
+              fi
+
+              ## Override group name
+              if [[ "${{ github.event.inputs.override_group_name }}" != "" ]]; then
+                echo "Targeting deployment to override group ${{ github.event.inputs.override_group_name }}..."
+                scriptArgs+=("--overridegroup" "${{ github.event.inputs.override_group_name }}")
+              fi
+
+              ## Canary group name
+              if [[ "${{ github.event.inputs.canary_group_name }}" != "" ]]; then
+                echo "Using canary group ${{ github.event.inputs.canary_group_name }}..."
+                scriptArgs+=("--canarygroup" "${{ github.event.inputs.canary_group_name }}")
+              fi
+
+              ## Canary abort
+              if [[ "${{ github.event.inputs.canary_abort }}" == "true" ]]; then
+                echo "Executing STOP for in-progress canary deployment!"
+                echo "canary_abort=true" >> $GITHUB_OUTPUT
+              else
+                echo "canary_abort=false" >> $GITHUB_OUTPUT
+              fi
+
+              ## Force update
+              if [[ ${{ github.event.inputs.force_deadline }} -gt 0 ]]; then
+                echo "Force update selected with deadline: ${{ github.event.inputs.force_deadline }} days"
+                scriptArgs+=("--deadline" "${{ github.event.inputs.force_deadline }}")
+                echo "forceUpdate=true" >> $GITHUB_OUTPUT
+              fi
+
+              ## Execution mode
+              if [[ "${{ github.event.inputs.execution_mode }}" == "debug" || "${{ github.event.inputs.execution_mode }}" == "debug_dry" ]]; then
+                echo "Running in debug mode"
+                scriptArgs+=("--debug")
+              fi
+
+              if [[ "${{ github.event.inputs.execution_mode }}" == "dry_run" || "${{ github.event.inputs.execution_mode }}" == "debug_dry" ]]; then
+                echo "Executing dry run"
+                scriptArgs+=("--dryrun")
+              fi
+
+              ## Operation mode
+              if [[ "${{ github.event.inputs.operation_mode }}" == "check" || "${{ github.event.inputs.operation_mode }}" == "check_and_retry" ]]; then
+                echo "Enabling plan status checking"
+                scriptArgs+=("--check")
+              fi
+
+              if [[ "${{ github.event.inputs.operation_mode }}" == "retry" || "${{ github.event.inputs.operation_mode }}" == "check_and_retry" ]]; then
+                echo "Enabling failed plan retries"
+                scriptArgs+=("--retry")
+              fi
+
+            fi
+
+            echo "scriptArgs=${scriptArgs[@]}" >> $GITHUB_ENV
+
+        - name: Restore deployment metadata cache
+          id: restoreDeploymentCache
+          uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+          continue-on-error: true
+          with:
+            path: ${{ env.metadataFile }}
+            key: macos-ddm-data_
+            restore-keys: |
+              macos-ddm-data_
+
+        - name: Restore SOFA feed cache
+          id: restoreSofaCache
+          uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+          continue-on-error: true
+          with:
+            path: "${{ github.workspace }}/cache/sofa"
+            key: macos-sofa-data_
+            restore-keys: |
+              macos-sofa-data_
+
+        - name: Pull latest SOFA feed data
+          id: downloadSofaFeed
+          run: |
+            set -euo pipefail
+            
+            echo "Downloading latest SOFA v2 feed data..."
+            if ! curl -sS --fail --url "https://sofa.macadmins.io/v2/macos_data_feed.json?" -o "/tmp/macos_data_feed.json"; then
+              echo "❌ Failed to download macOS data feed"
+              exit 1
+            fi
+            
+            # Validate JSON structure (v2 format)
+            if ! jq -e '.OSVersions[0].Latest.ProductVersion' "/tmp/macos_data_feed.json" >/dev/null; then
+              echo "❌ Invalid macOS data feed structure"
+              exit 1
+            fi
+            
+            if ! jq -e '.LastCheck' "/tmp/macos_data_feed.json" >/dev/null; then
+              echo "❌ Invalid feed structure - missing LastCheck field"
+              exit 1
+            fi
+            
+            if ! jq -e '.UpdateHash' "/tmp/macos_data_feed.json" >/dev/null; then
+              echo "❌ Invalid feed structure - missing UpdateHash field"
+              exit 1
+            fi
+            
+            echo "✅ SOFA v2 feed data downloaded and validated successfully"
+
+        - name: Check for forced deployment option
+          id: checkForceDeploy
+          if: ${{ github.event_name != 'schedule' }}
+          run: |
+            if [[ ${{ github.event.inputs.force_deadline }} -gt 0 ]]; then
+              echo "skipCompare=true" >> $GITHUB_OUTPUT
+            else
+              echo "skipCompare=false" >> $GITHUB_OUTPUT
+            fi
+
+        - name: Compare SOFA feed data
+          id: compareSofaData
+          if: ${{ steps.checkForceDeploy.outputs.skipCompare != 'true' }}
+          env:
+            cacheDir: "${{ github.workspace }}/cache/sofa"
+            minorVersionThreshold: 3  # .3+ = stable for "any" target
+          run: |
+            set -euo pipefail
+            
+            scriptArgs="${{ env.scriptArgs }}"
+            
+            # Helper function to update cache
+            updateCache() {
+              echo "📦 Updating cached SOFA data..."
+              mkdir -p "${cacheDir}"
+              cp "/tmp/macos_data_feed.json" "${cacheDir}/"
+              echo "✅ Cache updated successfully"
+            }
+            
+            # Pre-parse all JSON data
+            echo "🔍 Parsing SOFA v2 feed data..."
+            feedVersion=$(jq -r '.OSVersions[0].Latest.ProductVersion' "/tmp/macos_data_feed.json")
+            feedPriorVersion=$(jq -r '.OSVersions[1].Latest.ProductVersion' "/tmp/macos_data_feed.json")
+            feedTimestamp=$(jq -r '.LastCheck' "/tmp/macos_data_feed.json")
+            feedHash=$(jq -r '.UpdateHash' "/tmp/macos_data_feed.json")
+            
+            echo "📊 Feed Data Summary:"
+            echo "   Latest Version: ${feedVersion}"
+            echo "   Prior Version: ${feedPriorVersion}"
+            echo "   Last Check: ${feedTimestamp}"
+            echo "   Feed Hash: ${feedHash}"
+            
+            # Determine if new version found
+            newVersionFound="false"
+            
+            if [[ -f "${cacheDir}/macos_data_feed.json" ]]; then
+              echo "📋 Comparing with cached data..."
+              
+              cacheVersion=$(jq -r '.OSVersions[0].Latest.ProductVersion' "${cacheDir}/macos_data_feed.json")
+              cacheHash=$(jq -r '.UpdateHash' "${cacheDir}/macos_data_feed.json")
+              
+              echo "   Cached Version: ${cacheVersion}"
+              echo "   Cached Hash: ${cacheHash}"
+              
+              # Check for updates
+              if [[ "${feedVersion}" != "${cacheVersion}" ]]; then
+                echo "🆕 New macOS version detected: ${cacheVersion} → ${feedVersion}"
+                newVersionFound="true"
+                feedDataUpdated="true"
+              elif [[ "${feedHash}" != "${cacheHash}" ]]; then
+                echo "🔄 Feed data updated (same version but new hash)"
+                newVersionFound="false"
+                feedDataUpdated="true"
+              else
+                echo "✅ No changes detected in SOFA feed data"
+                newVersionFound="false"
+                feedDataUpdated="false"
+              fi
+            else
+              echo "📂 No cached feed data found, treating as new version"
+              newVersionFound="true"
+              feedDataUpdated="true"
+            fi
+            
+            # Update cache if feed data changed
+            if [[ "${feedDataUpdated}" == "true" ]]; then
+              updateCache
+            fi
+            
+            # Set outputs
+            echo "newVersionFound=${newVersionFound}" >> $GITHUB_OUTPUT
+            echo "feedDataUpdated=${feedDataUpdated}" >> $GITHUB_OUTPUT
+            echo "latestVersionFromFeed=${feedVersion}" >> $GITHUB_OUTPUT
+            echo "latestPriorVersionFromFeed=${feedPriorVersion}" >> $GITHUB_OUTPUT
+            
+            # Extract major increment for auto-targeting
+            majorIncrement=$(jq -r '.OSVersions[0].Latest.ProductVersion | split(".")[1]' "/tmp/macos_data_feed.json")
+            if ! [[ "${majorIncrement}" =~ ^[0-9]+$ ]]; then
+              echo "⚠️  Warning: Could not parse major increment from version ${feedVersion}"
+              majorIncrement=0
+            fi
+            
+            echo "latestMajorIncrement=${majorIncrement}" >> $GITHUB_OUTPUT
+            echo "🔢 Major increment: ${majorIncrement}"
+            
+            # Auto-target version logic for scheduled runs
+            if [[ "${{ github.event_name }}" == "schedule" && "${newVersionFound}" == "true" ]]; then
+              echo "⏰ Scheduled run with new version detected, applying auto-targeting logic..."
+              
+              if [[ ${majorIncrement} -ge ${minorVersionThreshold} ]]; then
+                echo "🎯 Version .${majorIncrement}+ detected (stable), setting target: ANY"
+                scriptArgs+=("--targetversion" "any")
+              else
+                echo "🎯 Version .${majorIncrement} detected (early), setting target: MINOR"
+                scriptArgs+=("--targetversion" "minor")
+              fi
+            fi
+            
+            echo "scriptArgs=${scriptArgs[@]}" >> $GITHUB_ENV
+
+        - name: Generate runtime script arguments
+          id: generateScriptArgs
+          run: |
+            scriptArgs="${{ env.scriptArgs }}"
+            echo "canaryDeployment=false" >> $GITHUB_OUTPUT
+            cleanSlate="false"
+
+            if [[ "${{ github.event.inputs.canary_group_name }}" != "" ]] || [[ "${{ github.event_name }}" == "schedule" ]]; then
+              echo "Canary group detected, enabling canary functionality..."
+              canaryGroupPresent="true"
+            else
+              canaryGroupPresent="false"
+            fi
+
+            if [[ -f ${{ env.metadataFile }} ]]; then
+              echo "Found existing deployment data, loading..."
+              existingDeploymentData=$(cat ${{ env.metadataFile }})
+            else
+              existingDeploymentData="{}"
+            fi
+
+            # Determine if we should skip this run based on canary/version logic
+            # This section handles canary deployment workflows and version checking
+            # TODO: Customize this logic for your organization's deployment strategy
+            
+            if [[ "${{ steps.compareSofaData.outcome }}" != "skipped" ]]; then
+              if [[ "${{ steps.compareSofaData.outputs.newVersionFound }}" == "false" ]]; then
+                if [[ $canaryGroupPresent == "true" ]]; then
+                  # Check for existing canary deployment
+                  schemaVersion=$(jq -r '.metadata.schemaVersion // "1.0"' <<< "$existingDeploymentData")
+                  
+                  if [[ "$schemaVersion" == "2.0" ]]; then
+                    deployedCanaryVersion=$(jq -r '.deployments | to_entries[] | select(.value.deploymentType == "canary" and .value.status == "active") | .value.targetVersion' <<< "$existingDeploymentData" | head -1)
+                    canaryDeadlineEpoch=$(jq -r '.deployments | to_entries[] | select(.value.deploymentType == "canary" and .value.status == "active") | .value.installationDeadlineEpoch' <<< "$existingDeploymentData" | head -1)
+                  else
+                    deployedCanaryVersion=$(jq -r '.latest.canary.targetVersion // null' <<< "$existingDeploymentData")
+                    canaryDeadlineEpoch=$(jq -r '.latest.canary.installationDeadlineEpoch // null' <<< "$existingDeploymentData")
+                  fi
+                  
+                  if [[ ! -z "$deployedCanaryVersion" && "$deployedCanaryVersion" != "null" ]] && [[ "${{ steps.processInput.outputs.canary_abort }}" != "true" ]]; then
+                    echo "Found canary deployment for macOS $deployedCanaryVersion in progress, checking for canary deadline..."
+                    currentDateEpoch=$(date '+%s')
+                    if [[ ! -z "$canaryDeadlineEpoch" && "$canaryDeadlineEpoch" != "null" && $currentDateEpoch -ge $canaryDeadlineEpoch ]]; then
+                      echo "Canary deadline passed, proceeding to wide deployment"
+                      scriptArgs+=("--canaryok")
+                      cleanSlate="true"
+                      scriptArgs+=("--canaryversion" "$deployedCanaryVersion")
+                      scriptArgs+=("--targetversion" "$deployedCanaryVersion")
+                      skipRun="false"
+                    else
+                      echo "Canary deadline not yet passed, skipping run"
+                      skipRun="true"
+                    fi
+                  elif [[ "${{ steps.processInput.outputs.canary_abort }}" == "true" ]]; then
+                    echo "Canary deployment aborted, skipping run"
+                    skipRun="true"
+                  else
+                    echo "No active canary found, proceeding with standard deployment..."
+                    skipRun="false"
+                  fi
+                else
+                  echo "No new macOS version found, skipping run..."
+                  skipRun="true"
+                fi
+                
+              elif [[ "${{ steps.compareSofaData.outputs.newVersionFound }}" == "true" ]]; then
+                echo "New macOS version detected, proceeding with deployment..."
+                if [[ $canaryGroupPresent == "true" ]]; then
+                  echo "canaryDeployment=true" >> $GITHUB_OUTPUT
+                  scriptArgs+=("--canaryversion" "${{ steps.compareSofaData.outputs.latestVersionFromFeed }}")
+                  skipRun="false"
+                else
+                  echo "No canary group specified, proceeding with wide deployment..."
+                  skipRun="false"
+                fi
+              else
+                echo "::error::Unexpected outcome from SOFA feed comparison, exiting..."
+                exit 1
+              fi
+            else
+              if [[ "${{ steps.checkForceDeploy.outputs.skipCompare }}" == "true" ]]; then
+                echo "Force deployment detected, proceeding with deployment..."
+                skipRun="false"
+                cleanSlate="true"
+              else
+                echo "No new macOS version detected, skipping run..."
+                skipRun="true"
+              fi
+            fi
+
+            scriptArgs+=("--feedsource" "${{ github.workspace }}/cache/sofa/macos_data_feed.json")
+
+            if [[ "$cleanSlate" == "true" ]]; then
+              echo "Clean slate detected, adding script argument to toggle DDM feature"
+              scriptArgs+=("--toggleddm")
+              echo "cleanSlateDeployment=true" >> $GITHUB_OUTPUT
+            else
+              echo "cleanSlateDeployment=false" >> $GITHUB_OUTPUT
+            fi
+
+            echo "skipRun=$skipRun" >> $GITHUB_OUTPUT
+            echo "Configured script arguments: $scriptArgs"
+            echo "scriptArgs=${scriptArgs[@]}" >> $GITHUB_ENV
+            echo $existingDeploymentData > ${{ env.metadataFile }}
+
+        - name: Run processor script
+          id: runProcessor
+          if: ${{ steps.generateScriptArgs.outputs.skipRun != 'true' || contains(github.event.inputs.operation_mode, 'retry') }}
+          run: |
+            scriptArgs="${{ env.scriptArgs }}"
+
+            echo "Executing DDM Update Deployment..."
+            
+            # TODO: Update this path to point to your macos-update-processor.py script
+            python3 "${{ github.workspace }}/macos-update-processor.py" "${(@s/ /)scriptArgs[@]}"
+
+            if [[ $? != 0 ]]; then
+              echo "Processor run failed, please see logs above for more information!"
+              echo "runCompleted=false" >> $GITHUB_OUTPUT
+            else
+              echo "Processor run completed successfully"
+              
+              # Extract deployment info for reporting
+              metadataContent=$(cat ${{ env.metadataFile }})
+              schemaVersion=$(jq -r '.metadata.schemaVersion // "1.0"' <<< "$metadataContent")
+              
+              if [[ "$schemaVersion" == "2.0" ]]; then
+                if [[ "${{ steps.generateScriptArgs.outputs.canaryDeployment }}" == "true" ]]; then
+                  deployedVersion=$(jq -r '.deployments | to_entries[] | select(.value.deploymentType == "canary") | .value.targetVersion' <<< "$metadataContent" | head -1)
+                  installDeadline=$(jq -r '.deployments | to_entries[] | select(.value.deploymentType == "canary") | .value.installationDeadline' <<< "$metadataContent" | head -1)
+                else
+                  deployedVersion=$(jq -r '.deployments | to_entries[] | select(.value.deploymentType == "standard") | .value.targetVersion' <<< "$metadataContent" | head -1)
+                  installDeadline=$(jq -r '.deployments | to_entries[] | select(.value.deploymentType == "standard") | .value.installationDeadline' <<< "$metadataContent" | head -1)
+                fi
+              else
+                # Legacy format
+                if [[ "${{ steps.generateScriptArgs.outputs.canaryDeployment }}" == "true" ]]; then
+                  deployedVersion=$(jq -r '.latest.canary.targetVersion // "unknown"' <<< "$metadataContent")
+                  installDeadline=$(jq -r '.latest.canary.installationDeadline // "unknown"' <<< "$metadataContent")
+                else
+                  deployedVersion=$(jq -r '.latest.standard.targetVersion // "unknown"' <<< "$metadataContent")
+                  installDeadline=$(jq -r '.latest.standard.installationDeadline // "unknown"' <<< "$metadataContent")
+                fi
+              fi
+              
+              echo "deployedVersion=$deployedVersion" >> $GITHUB_OUTPUT
+              echo "installDeadline=$installDeadline" >> $GITHUB_OUTPUT
+              echo "runCompleted=true" >> $GITHUB_OUTPUT
+            fi
+
+        - name: Exit if the processor run failed
+          if: ${{ steps.runProcessor.outputs.runCompleted == 'false' }}
+          uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd #v8.0.0
+          with:
+            script: |
+              core.setFailed('Processor run failed. Please check the logs above for more information.')
+
+        - name: Process metadata and cache
+          id: checkDeploymentOutcome
+          run: |
+            saveCache="false"
+
+            if [[ "${{ steps.runProcessor.outputs.runCompleted }}" == "true" ]] && [[ "${{ github.event.inputs.execution_mode }}" != "dry_run" ]] && [[ "${{ github.event.inputs.execution_mode }}" != "debug_dry" ]]; then
+              echo "Processor run completed successfully, saving deployment data cache and uploading log artifacts..."
+              if [[ "${{ steps.restoreSofaCache.outputs.cache-hit }}" != "true" || "${{ steps.restoreSofaCache.outputs.cache-matched-key }}" != "macos-sofa-data_${{ hashFiles('**/cache/sofa/**')}}" ]]; then
+                echo "Updated SOFA feed data found, saving cache..."
+                saveCache="true"
+              else
+                echo "No updated SOFA feed data found, skipping cache save..."
+              fi
+            fi
+
+            echo "saveCache=$saveCache" >> $GITHUB_OUTPUT
+
+        - name: Save metadata cache
+          id: saveDeploymentCache
+          if: ${{ steps.checkDeploymentOutcome.outputs.saveCache == 'true' }}
+          uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+          with:
+            path: ${{ env.metadataFile }}
+            key: macos-ddm-data_${{ hashFiles(env.metadataFile) }}
+
+        - name: Upload metadata and logs as artifacts
+          if: ${{ steps.checkDeploymentOutcome.outputs.saveCache == 'true' }}
+          uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+          with:
+            name: macos-ddm-data_${{ hashFiles(env.metadataFile) }}
+            path: |
+              ${{ github.workspace }}/cache/**
+              ${{ github.workspace }}/jamf-ddm-deploy_*.log
+
+        - name: Save SOFA feed cache
+          id: saveSofaCache
+          if: ${{ steps.checkDeploymentOutcome.outputs.saveCache == 'true' }}
+          uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+          continue-on-error: true
+          with:
+            path: "${{ github.workspace }}/cache/sofa"
+            key: macos-sofa-data_${{ hashFiles('**/cache/sofa/**') }}
+      
+        # TODO: Add your own post-deployment actions here
+        # Examples:
+        # - Send notifications (Slack, email, etc.)
+        # - Create tickets in your ticketing system
+        # - Post metrics to your monitoring system
+        # - Generate compliance reports
+        
+        - name: Report deployment results
+          if: ${{ steps.runProcessor.outputs.runCompleted == 'true' }}
+          run: |
+            echo "================================"
+            echo "Deployment Summary"
+            echo "================================"
+            echo "Deployed Version: ${{ steps.runProcessor.outputs.deployedVersion }}"
+            echo "Installation Deadline: ${{ steps.runProcessor.outputs.installDeadline }}"
+            echo "Deployment Type: ${{ steps.generateScriptArgs.outputs.canaryDeployment == 'true' && 'Canary' || 'Standard' }}"
+            echo "================================"
+            
+            # TODO: Add your custom reporting logic here
+            # Example: Post to Slack webhook
+            # curl -X POST -H 'Content-Type: application/json' \
+            #   -d '{"text":"macOS ${{ steps.runProcessor.outputs.deployedVersion }} deployed with deadline ${{ steps.runProcessor.outputs.installDeadline }}"}' \
+            #   "${{ secrets.SLACK_WEBHOOK_URL }}"
+
